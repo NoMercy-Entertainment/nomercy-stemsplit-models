@@ -1,0 +1,99 @@
+name: Release
+
+# Builds the stemsplit GGUF from Deezer's published checkpoint with the
+# converter that lives in nomercy-ffmpeg (tools/spleeter-gguf), then publishes
+# a release with the model, its SHA-256 sidecar and a signed manifest.json —
+# the same shape the whisper models use, so the media server can verify it
+# with the code it already has.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_ref:
+        description: "nomercy-ffmpeg ref that holds tools/spleeter-gguf"
+        required: false
+        default: "v1.0.40"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the converter from nomercy-ffmpeg
+        uses: actions/checkout@v4
+        with:
+          repository: NoMercy-Entertainment/nomercy-ffmpeg
+          ref: ${{ inputs.ffmpeg_ref }}
+          path: ffmpeg
+          sparse-checkout: |
+            tools/spleeter-gguf
+          sparse-checkout-cone-mode: false
+
+      - name: Build the converter image
+        run: docker build -t spleeter-gguf ffmpeg/tools/spleeter-gguf
+
+      - name: Prove the verifier fails on an empty tensor set
+        run: |
+          set -eu
+          if docker run --rm spleeter-gguf -c "import convert; convert.verify({})" 2>/dev/null; then
+            echo "::error::convert.verify({}) did not fail; the verifier is not guarding anything"
+            exit 1
+          fi
+          echo "verifier rejects an empty tensor set, as it must"
+
+      - name: Convert the checkpoint
+        run: |
+          set -eu
+          mkdir -p release
+          docker run --rm -v "$PWD/release:/out" spleeter-gguf convert.py \
+            --checkpoint /work/2stems --output /out/spleeter-2stems-f16.gguf | tee convert.log
+          grep -q "verify OK: 100 tensors" convert.log
+          grep -q "verify_dtypes OK: 100 tensors" convert.log
+          ls -l release/
+
+      - name: Choose the release tag
+        id: tag
+        run: |
+          set -eu
+          tag="v$(date -u +%Y.%m.%d)"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            tag="${tag}.$(date -u +%H%M)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release tag: $tag"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate signed manifest
+        uses: NoMercy-Entertainment/nomercy-media-server/.github/actions/generate-release-manifest@master
+        with:
+          output-dir: release
+          version: ${{ steps.tag.outputs.tag }}
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Require the signature
+        run: |
+          set -eu
+          if [ ! -s release/manifest.json.sig ]; then
+            echo "::error::manifest.json.sig is missing: GPG_PRIVATE_KEY is not available to this repository, and the media server refuses an unsigned manifest for models"
+            exit 1
+          fi
+          ls -l release/
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Stemsplit models ${{ steps.tag.outputs.tag }}" \
+            --notes "Spleeter 2stems (MIT, Deezer) converted to GGUF with nomercy-ffmpeg tools/spleeter-gguf at ${{ inputs.ffmpeg_ref }}. Verified: 100 tensors, names, shapes and dtypes. Files: spleeter-2stems-f16.gguf with its .sha256 sidecar, manifest.json and manifest.json.sig." \
+            --latest \
+            release/spleeter-2stems-f16.gguf \
+            release/spleeter-2stems-f16.gguf.sha256 \
+            release/manifest.json \
+            release/manifest.json.sig
